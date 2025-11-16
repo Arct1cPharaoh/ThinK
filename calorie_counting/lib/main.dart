@@ -10,9 +10,24 @@ import 'package:flutter/material.dart';
 import 'package:flutter/cupertino.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:flutter/foundation.dart' show kIsWeb;
 
 void main() {
-  runApp(const CalorieCountingApp());
+  runApp(const MyApp());
+}
+
+/// Top-level MaterialApp so Navigator is always available
+class MyApp extends StatelessWidget {
+  const MyApp({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return MaterialApp(
+      debugShowCheckedModeBanner: false,
+      theme: retroTheme,
+      home: const CalorieCountingApp(),
+    );
+  }
 }
 
 /// ---------- Retro colors ----------
@@ -155,7 +170,7 @@ double kgToLbs(double kg) => kg * 2.20462;
 double inchesToCm(double inches) => inches * 2.54;
 double cmToInches(double cm) => cm / 2.54;
 
-/// ---------- Root app with bottom navigation + persistence ----------
+/// ---------- Root stateful app (no nested MaterialApp) ----------
 
 class CalorieCountingApp extends StatefulWidget {
   const CalorieCountingApp({super.key});
@@ -169,9 +184,9 @@ class _CalorieCountingAppState extends State<CalorieCountingApp> {
 
   ProfileData _profile = ProfileData(
     heightCm: inchesToCm(69), // ~5'9"
-    weightKg: lbsToKg(154),   // ~154 lbs
+    weightKg: lbsToKg(154), // ~154 lbs
     gender: Gender.male,
-    lossLbsPerWeek: 0.0,      // maintain by default
+    lossLbsPerWeek: 0.0, // maintain by default
   );
 
   final List<MealEntry> _meals = [];
@@ -213,6 +228,40 @@ class _CalorieCountingAppState extends State<CalorieCountingApp> {
       } catch (_) {
         // ignore bad data
       }
+    }
+
+    // If no meals exist yet, inject fake data for testing history UI
+    if (_meals.isEmpty) {
+      final now = DateTime.now();
+      final List<MealEntry> fake = [];
+
+      // Generate 10 days of fake meals
+      for (int i = 0; i < 10; i++) {
+        final day = DateTime(now.year, now.month, now.day)
+            .subtract(Duration(days: i));
+        final base = 1400 + (i * 80); // varying totals
+
+        fake.addAll([
+          MealEntry(
+            name: "Breakfast",
+            calories: base * 0.3,
+            time: DateTime(day.year, day.month, day.day, 8, 0),
+          ),
+          MealEntry(
+            name: "Lunch",
+            calories: base * 0.4,
+            time: DateTime(day.year, day.month, day.day, 13, 0),
+          ),
+          MealEntry(
+            name: "Dinner",
+            calories: base * 0.3,
+            time: DateTime(day.year, day.month, day.day, 19, 0),
+          ),
+        ]);
+      }
+
+      _meals.addAll(fake);
+      await _saveMeals();
     }
 
     setState(() {
@@ -268,15 +317,8 @@ class _CalorieCountingAppState extends State<CalorieCountingApp> {
   @override
   Widget build(BuildContext context) {
     if (_isLoading) {
-      // Simple loading screen while reading prefs
-      return MaterialApp(
-        debugShowCheckedModeBanner: false,
-        theme: retroTheme,
-        home: const Scaffold(
-          body: Center(
-            child: CircularProgressIndicator(),
-          ),
-        ),
+      return const Scaffold(
+        body: Center(child: CircularProgressIndicator()),
       );
     }
 
@@ -299,51 +341,61 @@ class _CalorieCountingAppState extends State<CalorieCountingApp> {
         break;
       case 2:
       default:
-        title = "Profile & Goals";
-        body =
-            ProfilePage(profile: _profile, onProfileChanged: _updateProfile);
+        title = "History";
+        body = HistoryPage(meals: _meals, profile: _profile);
         break;
     }
 
-    return MaterialApp(
-      debugShowCheckedModeBanner: false,
-      theme: retroTheme,
-      home: Scaffold(
-        appBar: AppBar(
-          title: Text(title),
-          backgroundColor: Colors.transparent,
-        ),
-        body: Container(
-          decoration: const BoxDecoration(
-            gradient: LinearGradient(
-              colors: [kRetroDarkPurple, kRetroSurface],
-              begin: Alignment.topLeft,
-              end: Alignment.bottomRight,
-            ),
+    return Scaffold(
+      appBar: AppBar(
+        title: Text(title),
+        backgroundColor: Colors.transparent,
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.person_outline),
+            onPressed: () {
+              Navigator.of(context).push(
+                MaterialPageRoute(
+                  builder: (_) => ProfileScreen(
+                    profile: _profile,
+                    onProfileChanged: _updateProfile,
+                  ),
+                ),
+              );
+            },
           ),
-          child: SafeArea(child: body),
+        ],
+      ),
+      body: Container(
+        decoration: const BoxDecoration(
+          gradient: LinearGradient(
+            colors: [kRetroDarkPurple, kRetroSurface],
+            begin: Alignment.topLeft,
+            end: Alignment.bottomRight,
+          ),
         ),
-        bottomNavigationBar: BottomNavigationBar(
-          backgroundColor: kRetroSurface,
-          selectedItemColor: kRetroMagenta,
-          unselectedItemColor: Colors.white60,
-          currentIndex: _selectedIndex,
-          onTap: _onNavTapped,
-          items: const [
-            BottomNavigationBarItem(
-              icon: Icon(Icons.bubble_chart),
-              label: 'Today',
-            ),
-            BottomNavigationBarItem(
-              icon: Icon(Icons.camera_alt),
-              label: 'Add Meal',
-            ),
-            BottomNavigationBarItem(
-              icon: Icon(Icons.person),
-              label: 'Profile',
-            ),
-          ],
-        ),
+        child: SafeArea(child: body),
+      ),
+      bottomNavigationBar: BottomNavigationBar(
+        backgroundColor: kRetroSurface,
+        selectedItemColor: kRetroMagenta,
+        unselectedItemColor: Colors.white60,
+        currentIndex: _selectedIndex,
+        onTap: _onNavTapped,
+        items: const [
+          BottomNavigationBarItem(
+            icon: Icon(Icons.bubble_chart),
+            label: 'Today',
+          ),
+          BottomNavigationBarItem(
+            icon: Icon(Icons.camera_alt),
+            label: 'Add Meal',
+          ),
+          BottomNavigationBarItem(
+            icon: Icon(Icons.history),
+            label: 'History',
+          ),
+        ],
       ),
     );
   }
@@ -392,58 +444,97 @@ class _HomePageState extends State<HomePage> {
     final nameController = TextEditingController(text: meal.name);
     final caloriesController =
         TextEditingController(text: meal.calories.toStringAsFixed(0));
+    DateTime editedTime = meal.time;
 
     await showDialog(
       context: context,
       builder: (ctx) {
-        return AlertDialog(
-          backgroundColor: kRetroSurface,
-          title: const Text("Edit meal"),
-          content: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              TextField(
-                controller: nameController,
-                decoration: const InputDecoration(
-                  labelText: "Meal name",
-                ),
-              ),
-              const SizedBox(height: 8),
-              TextField(
-                controller: caloriesController,
-                decoration: const InputDecoration(
-                  labelText: "Calories (kcal)",
-                ),
-                keyboardType: TextInputType.number,
-              ),
-            ],
-          ),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.of(ctx).pop(),
-              child: const Text("Cancel"),
-            ),
-            TextButton(
-              onPressed: () {
-                final newName = nameController.text.trim().isEmpty
-                    ? meal.name
-                    : nameController.text.trim();
-                final newCalories =
-                    double.tryParse(caloriesController.text) ?? meal.calories;
-
-                final updated = MealEntry(
-                  name: newName,
-                  calories: newCalories,
-                  time: meal.time,
-                  imagePath: meal.imagePath,
+        return StatefulBuilder(
+          builder: (ctx, setLocalState) {
+            Future<void> pickTime() async {
+              final initial = TimeOfDay.fromDateTime(editedTime);
+              final picked = await showTimePicker(
+                context: ctx,
+                initialTime: initial,
+              );
+              if (picked != null) {
+                final newDateTime = DateTime(
+                  editedTime.year,
+                  editedTime.month,
+                  editedTime.day,
+                  picked.hour,
+                  picked.minute,
                 );
+                setLocalState(() {
+                  editedTime = newDateTime;
+                });
+              }
+            }
 
-                widget.onUpdateMeal(index, updated);
-                Navigator.of(ctx).pop();
-              },
-              child: const Text("Save"),
-            ),
-          ],
+            return AlertDialog(
+              backgroundColor: kRetroSurface,
+              title: const Text("Edit meal"),
+              content: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  TextField(
+                    controller: nameController,
+                    decoration: const InputDecoration(
+                      labelText: "Meal name",
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+                  TextField(
+                    controller: caloriesController,
+                    decoration: const InputDecoration(
+                      labelText: "Calories (kcal)",
+                    ),
+                    keyboardType: TextInputType.number,
+                  ),
+                  const SizedBox(height: 12),
+                  Align(
+                    alignment: Alignment.centerLeft,
+                    child: TextButton.icon(
+                      onPressed: pickTime,
+                      icon: const Icon(Icons.access_time,
+                          color: kRetroTeal),
+                      label: Text(
+                        "Time: ${TimeOfDay.fromDateTime(editedTime).format(ctx)}",
+                        style: const TextStyle(color: Colors.white),
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+              actions: [
+                TextButton(
+                  onPressed: () => Navigator.of(ctx).pop(),
+                  child: const Text("Cancel"),
+                ),
+                TextButton(
+                  onPressed: () {
+                    final newName = nameController.text.trim().isEmpty
+                        ? meal.name
+                        : nameController.text.trim();
+                    final newCalories =
+                        double.tryParse(caloriesController.text) ??
+                            meal.calories;
+
+                    final updated = MealEntry(
+                      name: newName,
+                      calories: newCalories,
+                      time: editedTime,
+                      imagePath: meal.imagePath,
+                    );
+
+                    widget.onUpdateMeal(index, updated);
+                    Navigator.of(ctx).pop();
+                  },
+                  child: const Text("Save"),
+                ),
+              ],
+            );
+          },
         );
       },
     );
@@ -714,7 +805,7 @@ class _RetroCard extends StatelessWidget {
   }
 }
 
-/// ---------- Add Meal page (camera + mock AI, keyboard-safe) ----------
+/// ---------- ONNX calorie model ----------
 
 class CalorieModel {
   CalorieModel._();
@@ -803,7 +894,6 @@ class CalorieModel {
       o?.release();
     }
 
-    // Be flexible about what the plugin returns
     double logKcal;
 
     if (outValue is Float32List) {
@@ -817,7 +907,8 @@ class CalorieModel {
       } else if (first is List && first.isNotEmpty && first.first is num) {
         logKcal = (first.first as num).toDouble();
       } else {
-        throw Exception('Unexpected ONNX output element type: ${first.runtimeType}');
+        throw Exception(
+            'Unexpected ONNX output element type: ${first.runtimeType}');
       }
     } else {
       throw Exception('Unexpected ONNX output type: ${outValue.runtimeType}');
@@ -828,6 +919,8 @@ class CalorieModel {
     return kcal < 0 ? 0.0 : kcal;
   }
 }
+
+/// ---------- Add Meal page (camera + AI, keyboard-safe) ----------
 
 class AddMealPage extends StatefulWidget {
   final ProfileData profile;
@@ -881,10 +974,10 @@ class _AddMealPageState extends State<AddMealPage> {
     });
 
     try {
-      // 1) Make sure the model is loaded
+      // Make sure the model is loaded
       await CalorieModel.instance.init();
 
-      // 2) Run estimation on the captured image
+      // Run estimation on the captured image
       final kcal = await CalorieModel.instance
           .estimateCaloriesFromImage(File(_imageFile!.path));
 
@@ -1000,7 +1093,7 @@ class _AddMealPageState extends State<AddMealPage> {
                 child: FilledButton.icon(
                   onPressed: _takePhoto,
                   icon: const Icon(Icons.camera_alt),
-                  label: const Text("Take Photo"),
+                  label: const Text("Snap"),
                 ),
               ),
               const SizedBox(width: 12),
@@ -1014,7 +1107,7 @@ class _AddMealPageState extends State<AddMealPage> {
                           child: CircularProgressIndicator(strokeWidth: 2),
                         )
                       : const Icon(Icons.auto_awesome),
-                  label: Text(_isEstimating ? "Analyzing..." : "Estimate"),
+                  label: Text(_isEstimating ? "Estim." : "AI Est."),
                 ),
               ),
               const SizedBox(width: 12),
@@ -1033,7 +1126,143 @@ class _AddMealPageState extends State<AddMealPage> {
   }
 }
 
-/// ---------- Profile page (height slider + weight input) ----------
+/// ---------- Height picker (rolling wheel on mobile, dropdowns on web) ----------
+
+class _HeightPicker extends StatelessWidget {
+  final int feet;
+  final int inches;
+  final void Function(int feet, int inches) onChanged;
+
+  const _HeightPicker({
+    required this.feet,
+    required this.inches,
+    required this.onChanged,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final feetOptions = [4, 5, 6, 7];
+    final inchOptions = List<int>.generate(12, (i) => i);
+
+    if (kIsWeb) {
+      // Web fallback: dropdowns (CupertinoPicker + trackpad = pain)
+      return Row(
+        children: [
+          Expanded(
+            child: DropdownButtonFormField<int>(
+              value: feet.clamp(4, 7),
+              decoration: InputDecoration(
+                labelText: "Feet",
+                filled: true,
+                fillColor: kRetroSurface.withOpacity(0.9),
+                border: OutlineInputBorder(
+                  borderRadius: BorderRadius.circular(16),
+                ),
+              ),
+              items: feetOptions
+                  .map(
+                    (f) => DropdownMenuItem(
+                      value: f,
+                      child: Text("$f ft"),
+                    ),
+                  )
+                  .toList(),
+              onChanged: (f) {
+                if (f != null) onChanged(f, inches);
+              },
+            ),
+          ),
+          const SizedBox(width: 12),
+          Expanded(
+            child: DropdownButtonFormField<int>(
+              value: inches.clamp(0, 11),
+              decoration: InputDecoration(
+                labelText: "Inches",
+                filled: true,
+                fillColor: kRetroSurface.withOpacity(0.9),
+                border: OutlineInputBorder(
+                  borderRadius: BorderRadius.circular(16),
+                ),
+              ),
+              items: inchOptions
+                  .map(
+                    (i) => DropdownMenuItem(
+                      value: i,
+                      child: Text("$i in"),
+                    ),
+                  )
+                  .toList(),
+              onChanged: (i) {
+                if (i != null) onChanged(feet, i);
+              },
+            ),
+          ),
+        ],
+      );
+    }
+
+    // Mobile: rolling "clock" style pickers
+    final feetController = FixedExtentScrollController(
+      initialItem: feetOptions.indexOf(feet.clamp(4, 7)),
+    );
+    final inchController = FixedExtentScrollController(
+      initialItem: inchOptions.indexOf(inches.clamp(0, 11)),
+    );
+
+    return SizedBox(
+      height: 130,
+      child: Row(
+        children: [
+          Expanded(
+            child: Container(
+              decoration: BoxDecoration(
+                color: kRetroSurface.withOpacity(0.9),
+                borderRadius: BorderRadius.circular(16),
+              ),
+              child: CupertinoPicker(
+                scrollController: feetController,
+                itemExtent: 32,
+                magnification: 1.1,
+                squeeze: 1.1,
+                onSelectedItemChanged: (index) {
+                  final f = feetOptions[index];
+                  onChanged(f, inches);
+                },
+                children: feetOptions
+                    .map((f) => Center(child: Text("$f ft")))
+                    .toList(),
+              ),
+            ),
+          ),
+          const SizedBox(width: 12),
+          Expanded(
+            child: Container(
+              decoration: BoxDecoration(
+                color: kRetroSurface.withOpacity(0.9),
+                borderRadius: BorderRadius.circular(16),
+              ),
+              child: CupertinoPicker(
+                scrollController: inchController,
+                itemExtent: 32,
+                magnification: 1.1,
+                squeeze: 1.1,
+                onSelectedItemChanged: (index) {
+                  final i = inchOptions[index];
+                  onChanged(feet, i);
+                },
+                children: inchOptions
+                    .map((i) => Center(child: Text("$i in")))
+                    .toList(),
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+/// ---------- Profile page (height picker + weight input) ----------
 
 enum LossTimeframe { week, month }
 
@@ -1054,7 +1283,7 @@ class ProfilePage extends StatefulWidget {
 class _ProfilePageState extends State<ProfilePage> {
   late Gender _gender;
 
-  // Height in inches, controlled by slider
+  // Height in inches, controlled by picker
   late double _heightInchesTotal;
 
   // Weight input controller in lbs
@@ -1094,8 +1323,8 @@ class _ProfilePageState extends State<ProfilePage> {
     final heightCm = inchesToCm(_heightInchesTotal);
 
     // Parse lbs from text
-    final parsedLbs =
-        double.tryParse(_weightController.text) ?? kgToLbs(widget.profile.weightKg);
+    final parsedLbs = double.tryParse(_weightController.text) ??
+        kgToLbs(widget.profile.weightKg);
     final weightKg = lbsToKg(parsedLbs);
 
     // Convert current UI loss rate into weekly
@@ -1124,9 +1353,8 @@ class _ProfilePageState extends State<ProfilePage> {
   Widget build(BuildContext context) {
     final maintenance = maintenanceCalories(widget.profile);
     final target = targetCalories(widget.profile);
-    final lossPerWeekDisplay = _lossTimeframe == LossTimeframe.week
-        ? _lossAmount
-        : _lossAmount / 4.0;
+    final lossPerWeekDisplay =
+        _lossTimeframe == LossTimeframe.week ? _lossAmount : _lossAmount / 4.0;
 
     final int feet = _heightInchesTotal ~/ 12;
     final int inches = (_heightInchesTotal - feet * 12).round();
@@ -1150,7 +1378,7 @@ class _ProfilePageState extends State<ProfilePage> {
             ),
           ),
           const SizedBox(height: 16),
-          // HEIGHT SLIDER
+          // HEIGHT PICKER
           Align(
             alignment: Alignment.centerLeft,
             child: Text(
@@ -1163,15 +1391,14 @@ class _ProfilePageState extends State<ProfilePage> {
             "$feet ft $inches in",
             style: const TextStyle(fontWeight: FontWeight.bold),
           ),
-          Slider(
-            value: _heightInchesTotal,
-            min: 48.0, // 4'0"
-            max: 84.0, // 7'0"
-            divisions: 36,
-            label: "$feet'${inches.toString().padLeft(2, '0')}\"",
-            onChanged: (v) {
+          const SizedBox(height: 8),
+          _HeightPicker(
+            feet: feet,
+            inches: inches,
+            onChanged: (newFeet, newInches) {
               setState(() {
-                _heightInchesTotal = v;
+                final totalInches = (newFeet * 12 + newInches).toDouble();
+                _heightInchesTotal = totalInches.clamp(48.0, 84.0);
               });
             },
           ),
@@ -1309,6 +1536,280 @@ class _ProfilePageState extends State<ProfilePage> {
             ),
           ),
         ],
+      ),
+    );
+  }
+}
+
+/// ---------- History page (horizontal bar chart + per-day detail) ----------
+
+class HistoryPage extends StatefulWidget {
+  final List<MealEntry> meals;
+  final ProfileData profile;
+
+  const HistoryPage({
+    super.key,
+    required this.meals,
+    required this.profile,
+  });
+
+  @override
+  State<HistoryPage> createState() => _HistoryPageState();
+}
+
+class _HistoryPageState extends State<HistoryPage> {
+  DateTime? _selectedDay;
+
+  @override
+  Widget build(BuildContext context) {
+    if (widget.meals.isEmpty) {
+      return const Center(
+        child: Text("No history yet. Log some meals first!"),
+      );
+    }
+
+    final goal = targetCalories(widget.profile);
+
+    // Group meals by day
+    final Map<DateTime, List<MealEntry>> byDay = {};
+    for (final meal in widget.meals) {
+      final d = DateTime(meal.time.year, meal.time.month, meal.time.day);
+      byDay.putIfAbsent(d, () => []).add(meal);
+    }
+
+    // Sort days oldest -> newest
+    final days = byDay.keys.toList()..sort((a, b) => a.compareTo(b));
+
+    // Daily totals
+    final Map<DateTime, double> totals = {};
+    for (final day in days) {
+      totals[day] = byDay[day]!
+          .fold<double>(0, (sum, m) => sum + m.calories);
+    }
+
+    DateTime selectedDay = _selectedDay ?? days.last;
+    if (!byDay.containsKey(selectedDay)) {
+      selectedDay = days.last;
+    }
+
+    final maxTotal = totals.values.fold<double>(
+        0, (prev, v) => v > prev ? v : prev);
+    final selectedMeals = byDay[selectedDay]!;
+    final selectedTotal = totals[selectedDay] ?? 0.0;
+
+    // Trend: average (total - goal) across days
+    double sumDelta = 0.0;
+    for (final d in days) {
+      sumDelta += (totals[d]! - goal);
+    }
+    final avgDelta = sumDelta / days.length;
+
+    String trendText;
+    Color trendColor;
+    if (avgDelta.abs() < 50) {
+      trendText =
+          "Roughly even with your goal (±${avgDelta.round()} kcal/day).";
+      trendColor = Colors.white70;
+    } else if (avgDelta < 0) {
+      trendText =
+          "On average ~${avgDelta.abs().round()} kcal/day deficit (generally -EV for calories).";
+      trendColor = kRetroTeal;
+    } else {
+      trendText =
+          "On average ~${avgDelta.round()} kcal/day surplus (generally +EV for calories).";
+      trendColor = kRetroMagenta;
+    }
+
+    String selectedLabel;
+    if (isSameDay(selectedDay, DateTime.now())) {
+      selectedLabel = "Today";
+    } else {
+      selectedLabel =
+          "${selectedDay.month}/${selectedDay.day}/${selectedDay.year}";
+    }
+
+    String selectedSummary;
+    Color selectedColor;
+    if (selectedTotal <= goal) {
+      selectedSummary =
+          "Good day: ${selectedTotal.toStringAsFixed(0)} / ${goal.toStringAsFixed(0)} kcal.";
+      selectedColor = kRetroTeal;
+    } else {
+      final over = selectedTotal - goal;
+      selectedSummary =
+          "Over goal by ${over.toStringAsFixed(0)} kcal.";
+      selectedColor = kRetroMagenta;
+    }
+
+    return SingleChildScrollView(
+      padding: const EdgeInsets.all(16),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          _RetroCard(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text("Trends",
+                    style: Theme.of(context).textTheme.headlineSmall),
+                const SizedBox(height: 8),
+                Text(
+                  trendText,
+                  style: TextStyle(color: trendColor),
+                ),
+                const SizedBox(height: 4),
+                Text(
+                  "Daily target: ${goal.toStringAsFixed(0)} kcal/day",
+                  style: const TextStyle(
+                      fontSize: 12, color: Colors.white70),
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(height: 16),
+          Text(
+            "Daily Bars",
+            style: Theme.of(context).textTheme.headlineMedium,
+          ),
+          const SizedBox(height: 8),
+          SizedBox(
+            height: 180,
+            child: ListView.builder(
+              scrollDirection: Axis.horizontal,
+              itemCount: days.length,
+              itemBuilder: (context, index) {
+                final day = days[index];
+                final total = totals[day]!;
+                final ratio = maxTotal <= 0
+                    ? 0.1
+                    : (total / maxTotal).clamp(0.1, 1.0);
+                final isSelected = isSameDay(day, selectedDay);
+
+                final bool isGood = total <= goal;
+                final Color barColor =
+                    isGood ? kRetroTeal : kRetroMagenta;
+
+                final String shortLabel =
+                    "${day.month}/${day.day}";
+
+                return GestureDetector(
+                  onTap: () {
+                    setState(() {
+                      _selectedDay = day;
+                    });
+                  },
+                  child: Padding(
+                    padding:
+                        const EdgeInsets.symmetric(horizontal: 6.0),
+                    child: Column(
+                      mainAxisAlignment: MainAxisAlignment.end,
+                      children: [
+                        Container(
+                          width: isSelected ? 32 : 24,
+                          height: 120 * ratio,
+                          decoration: BoxDecoration(
+                            color: barColor
+                                .withOpacity(isSelected ? 1.0 : 0.7),
+                            borderRadius: BorderRadius.circular(12),
+                            border: isSelected
+                                ? Border.all(
+                                    color: Colors.white, width: 2)
+                                : null,
+                          ),
+                        ),
+                        const SizedBox(height: 6),
+                        Text(
+                          shortLabel,
+                          style: TextStyle(
+                            fontSize: 12,
+                            color: isSelected
+                                ? Colors.white
+                                : Colors.white70,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                );
+              },
+            ),
+          ),
+          const SizedBox(height: 16),
+          Text(
+            "Details for $selectedLabel",
+            style: Theme.of(context).textTheme.headlineSmall,
+          ),
+          const SizedBox(height: 4),
+          Text(
+            selectedSummary,
+            style: TextStyle(color: selectedColor),
+          ),
+          const SizedBox(height: 8),
+          ...selectedMeals.map(
+            (meal) => Card(
+              color: kRetroSurface.withOpacity(0.9),
+              shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(16)),
+              margin: const EdgeInsets.symmetric(vertical: 4),
+              child: ListTile(
+                leading: meal.imagePath != null
+                    ? ClipRRect(
+                        borderRadius: BorderRadius.circular(12),
+                        child: Image.file(
+                          File(meal.imagePath!),
+                          width: 40,
+                          height: 40,
+                          fit: BoxFit.cover,
+                        ),
+                      )
+                    : const Icon(Icons.restaurant, color: kRetroTeal),
+                title: Text(meal.name),
+                subtitle: Text(
+                  "${meal.calories.toStringAsFixed(0)} kcal • "
+                  "${TimeOfDay.fromDateTime(meal.time).format(context)}",
+                ),
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+/// ---------- Profile screen (full page, launched from app bar) ----------
+
+class ProfileScreen extends StatelessWidget {
+  final ProfileData profile;
+  final void Function(ProfileData) onProfileChanged;
+
+  const ProfileScreen({
+    super.key,
+    required this.profile,
+    required this.onProfileChanged,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('Profile & Goals'),
+        backgroundColor: Colors.transparent,
+      ),
+      body: Container(
+        decoration: const BoxDecoration(
+          gradient: LinearGradient(
+            colors: [kRetroDarkPurple, kRetroSurface],
+            begin: Alignment.topLeft,
+            end: Alignment.bottomRight,
+          ),
+        ),
+        child: SafeArea(
+          child: ProfilePage(
+            profile: profile,
+            onProfileChanged: onProfileChanged,
+          ),
+        ),
       ),
     );
   }
