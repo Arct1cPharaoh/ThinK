@@ -1,56 +1,40 @@
-# save as: flutter_converter.py  (run from ml/ directory)
-
+# flutter_yolo_converter.py (inside ThinK/ml/)
 from pathlib import Path
-import torch
-from train import CalorieRegressor
+from shutil import copy2
+from ultralytics import YOLO
 
-DEVICE = "cpu"
+YOLO_WEIGHTS_PATH = Path("seg/runs_foodgroups/yolov8n_foodgroups/weights/best.pt")
 
-ML_ROOT = Path(__file__).parent.resolve()
-ARTIFACTS_DIR = ML_ROOT / "artifacts"
-WEIGHTS_PATH = ARTIFACTS_DIR / "calorie_regressor_efficientnet_b0.pt"
+# __file__ = ThinK/ml/seg/flutter_converter.py
+ML_ROOT = Path(__file__).parent.resolve()     # → ThinK/ml/seg
+PROJECT_ROOT = ML_ROOT.parent.parent          # → ThinK/
 
-# export directly into Flutter project:
 FLUTTER_ONNX_PATH = (
-    ML_ROOT.parent  # .../ThinK/
-    / "calorie_counting"
-    / "assets"
-    / "models"
-    / "calorie_regressor_efficientnet_b0.onnx"
+    PROJECT_ROOT / "calorie_counting" / "assets" / "models" / "foodgroups_yolo.onnx"
 )
 
-
 def main():
-    # 1) rebuild model + load weights
-    model = CalorieRegressor()
-    state = torch.load(WEIGHTS_PATH, map_location=DEVICE)
-    model.load_state_dict(state)
-    model.to(DEVICE)
-    model.eval()
+    print("[INFO] Loading YOLO model:", YOLO_WEIGHTS_PATH)
+    model = YOLO(str(YOLO_WEIGHTS_PATH))
 
-    # 2) dummy input (3x224x224)
-    dummy = torch.randn(1, 3, 224, 224, device=DEVICE)
-
-    # 3) ensure output dir in Flutter project exists
     FLUTTER_ONNX_PATH.parent.mkdir(parents=True, exist_ok=True)
 
-    # 4) export ONNX directly into calorie_counting/assets/models/
-    torch.onnx.export(
-        model,
-        dummy,
-        FLUTTER_ONNX_PATH.as_posix(),
-        input_names=["input"],
-        output_names=["log_kcal"],  # log(calories + 1)
-        opset_version=17,
-        dynamic_axes={
-            "input": {0: "batch_size"},
-            "log_kcal": {0: "batch_size"},
-        },
-        do_constant_folding=True,
+    print("[INFO] Exporting ONNX…")
+    exported_path = Path(
+        model.export(
+            format="onnx",
+            opset=17,
+            imgsz=640,
+            dynamic=True,
+            optimize=True,
+            simplify=True,
+            half=False,
+        )
     )
 
-    print(f"[OK] ONNX model saved to: {FLUTTER_ONNX_PATH}")
+    copy2(exported_path, FLUTTER_ONNX_PATH)
 
+    print("\n[OK] Copied to:", FLUTTER_ONNX_PATH)
 
 if __name__ == "__main__":
     main()

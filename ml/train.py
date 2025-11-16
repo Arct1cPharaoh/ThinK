@@ -8,6 +8,7 @@ from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms, models
 from PIL import Image
 from tqdm.auto import tqdm
+from ultralytics import YOLO
 
 
 MIN_CALORIES = 0.0
@@ -15,6 +16,10 @@ MIN_CALORIES = 0.0
 DATA_ROOT = Path("data/mm_food_100k")
 IMG_DIR = DATA_ROOT / "images"
 META_PATH = DATA_ROOT / "meta.jsonl"
+
+YOLO_MODEL_PATH = Path(
+    "seg/runs_foodgroups/yolov8n_foodgroups/weights/best.pt"
+)
 
 
 # -----------------------
@@ -39,7 +44,8 @@ class LocalFoodDataset(Dataset):
         calories = float(ex["calories_kcal"])
         calories = max(calories, MIN_CALORIES)
 
-        return img, torch.tensor(calories, dtype=torch.float32)
+        # NOTE: we now return image path so YOLO can run on original image
+        return img, str(img_path), torch.tensor(calories, dtype=torch.float32)
 
 
 def load_meta(meta_path: Path, max_samples: int | None = None) -> List[dict]:
@@ -150,15 +156,16 @@ def build_dataloaders(train_dataset, val_dataset, batch_size: int = 32):
 
 
 # -----------------------
-# Model: calories only
+# Model: image + food-group vector
 # -----------------------
-class CalorieRegressor(nn.Module):
+class CalorieRegressorWithGroups(nn.Module):
     """
-    EfficientNet-B0 backbone with a regression head.
-    Predicts log(calories + 1), which is later expm1'ed back to calories.
+    EfficientNet-B0 backbone with a regression head that also
+    conditions on a YOLO food-group vector (e.g. area fractions).
+    Predicts log(calories + 1).
     """
 
-    def __init__(self):
+    def __init__(self, n_groups: int):
         super().__init__()
         backbone = models.efficientnet_b0(
             weights=models.EfficientNet_B0_Weights.IMAGENET1K_V1
@@ -167,14 +174,14 @@ class CalorieRegressor(nn.Module):
         backbone.classifier = nn.Identity()
 
         self.backbone = backbone
-        self.fc_reg = nn.Linear(in_features, 1)
+        self.fc_reg = nn.Linear(in_features + n_groups, 1)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        feats = self.backbone(x)
-        log_kcal = self.fc_reg(feats).squeeze(1)
-        # keep log_kcal reasonably bounded below; calories can't be negative
-        log_kcal = log_kcal.clamp_min(0.0)
-        return log_kcal
+    def forward(self, x: torch.Tensor, group_vec: torch.Tensor) -> torch.Tensor:
+        # x: (B, 3, H, W), group_vec: (B, n_groups)
+        feats = self.backbone(x)                 # (B, in_features)
+        z = torch.cat([feats, group_vec], dim=1) # (B, in_features + n_groups)
+        log_kcal = self.fc_reg(z).squeeze(1)
+        return log_kcal.clamp_min(0.0)
 
     @staticmethod
     def log_to_kcal(log_kcal: torch.Tensor) -> torch.Tensor:
@@ -182,11 +189,40 @@ class CalorieRegressor(nn.Module):
         return kcal.clamp_min(MIN_CALORIES)
 
 
-def build_model(lr: float):
-    model = CalorieRegressor()
+def build_model(lr: float, n_groups: int):
+    model = CalorieRegressorWithGroups(n_groups)
     reg_loss = nn.SmoothL1Loss()
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     return model, reg_loss, optimizer
+
+
+# -----------------------
+# YOLO-based food-group features
+# -----------------------
+def compute_group_vectors(detector: YOLO, img_paths: List[str], device) -> torch.Tensor:
+    k = len(detector.names)
+
+    # NOTE: disable per-image logging
+    results = detector(img_paths, verbose=False)  # <--- add verbose=False
+
+    group_vecs = []
+    for res in results:
+        h, w = res.orig_shape[:2]
+        total_area = float(w * h) + 1e-6
+
+        vec = torch.zeros(k, dtype=torch.float32)
+        for box in res.boxes:
+            cid = int(box.cls.item())
+            x1, y1, x2, y2 = box.xyxy[0].tolist()
+            area = max(x2 - x1, 0.0) * max(y2 - y1, 0.0)
+            frac = float(area / total_area)
+            vec[cid] += frac
+
+        vec = torch.clamp(vec, 0.0, 1.0)
+        group_vecs.append(vec)
+
+    group_vecs = torch.stack(group_vecs, dim=0).to(device)
+    return group_vecs
 
 
 # -----------------------
@@ -195,20 +231,25 @@ def build_model(lr: float):
 def _step(
     model,
     imgs,
+    img_paths,
     calories,
     reg_loss,
     device,
+    detector: YOLO,
 ):
     imgs = imgs.to(device)
     calories = calories.to(device).clamp_min(MIN_CALORIES)
 
+    # compute YOLO food-group features on the fly
+    group_vecs = compute_group_vectors(detector, img_paths, device)
+
     target_log = torch.log1p(calories)
-    pred_log = model(imgs)
+    pred_log = model(imgs, group_vecs)
 
     loss = reg_loss(pred_log, target_log)
 
     with torch.no_grad():
-        pred_kcal = CalorieRegressor.log_to_kcal(pred_log)
+        pred_kcal = CalorieRegressorWithGroups.log_to_kcal(pred_log)
         mae = torch.abs(pred_kcal - calories).mean()
 
     return loss, mae
@@ -220,6 +261,7 @@ def train_one_epoch(
     optimizer,
     reg_loss,
     device,
+    detector: YOLO,
     epoch: int,
     num_epochs: int,
 ):
@@ -229,15 +271,17 @@ def train_one_epoch(
     n_train = len(train_loader.dataset)
 
     train_pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{num_epochs} [train]")
-    for imgs, calories in train_pbar:
+    for imgs, img_paths, calories in train_pbar:
         optimizer.zero_grad()
 
         loss, mae = _step(
             model,
             imgs,
+            img_paths,
             calories,
             reg_loss,
             device,
+            detector,
         )
 
         loss.backward()
@@ -263,6 +307,7 @@ def validate(
     val_loader,
     reg_loss,
     device,
+    detector: YOLO,
     epoch: int,
     num_epochs: int,
 ):
@@ -272,13 +317,15 @@ def validate(
     n_val = len(val_loader.dataset)
 
     val_pbar = tqdm(val_loader, desc=f"Epoch {epoch}/{num_epochs} [val]")
-    for imgs, calories in val_pbar:
+    for imgs, img_paths, calories in val_pbar:
         loss, mae = _step(
             model,
             imgs,
+            img_paths,
             calories,
             reg_loss,
             device,
+            detector,
         )
 
         batch_size = imgs.size(0)
@@ -302,7 +349,7 @@ def train(
     num_epochs: int = 8,
     batch_size: int = 16,
     lr: float = 1e-4,
-    max_samples: int | None = 2000,
+    max_samples: int | None = 10000,
     out_dir: Path = Path("artifacts"),
 ):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -311,10 +358,15 @@ def train(
     meta = load_meta(META_PATH, max_samples=max_samples)
     print(f"Loaded {len(meta)} local samples")
 
+    # build YOLO once and reuse
+    detector = YOLO(str(YOLO_MODEL_PATH))
+    n_groups = len(detector.names)
+    print("Using n_groups =", n_groups)
+
     train_dataset, val_dataset = build_datasets_from_meta(meta, val_ratio=0.1)
     train_loader, val_loader = build_dataloaders(train_dataset, val_dataset, batch_size)
 
-    model, reg_loss, optimizer = build_model(lr)
+    model, reg_loss, optimizer = build_model(lr, n_groups)
     model = model.to(device)
 
     for epoch in range(1, num_epochs + 1):
@@ -324,6 +376,7 @@ def train(
             optimizer,
             reg_loss,
             device,
+            detector,
             epoch,
             num_epochs,
         )
@@ -337,13 +390,14 @@ def train(
             val_loader,
             reg_loss,
             device,
+            detector,
             epoch,
             num_epochs,
         )
         print(f"  val_loss={val_loss:.4f} val_mae_kcal={val_mae:.2f}")
 
     out_dir.mkdir(parents=True, exist_ok=True)
-    model_path = out_dir / "calorie_regressor_efficientnet_b0.pt"
+    model_path = out_dir / "calorie_regressor_efficientnet_b0_groups.pt"
     torch.save(model.state_dict(), model_path)
     print("Saved model to", model_path)
 

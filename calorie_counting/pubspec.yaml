@@ -27,3 +27,4 @@ flutter:
   uses-material-design: true
   assets:
     - assets/models/calorie_regressor_efficientnet_b0.onnx
+    - assets/models/foodgroups_yolo.onnx
