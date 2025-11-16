@@ -7,7 +7,16 @@
 .buildlog/
 .history
 
+# ---------- ML / training artifacts ----------
+ml/data/
+ml/data/**
+ml/artifacts/
+ml/**/*.pt
+ml/**/*.onnx
+ml/**/*.tflite
 
+# (Note: keep the runtime model in Flutter assets)
+# calorie_counting/assets/models/calorie_regressor_efficientnet_b0.onnx is NOT ignored
 
 # Flutter repo-specific
 /bin/cache/

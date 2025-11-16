@@ -1,6 +1,11 @@
 import 'dart:convert';
 import 'dart:io';
+import 'dart:math' as math;
+import 'dart:typed_data';
 
+import 'package:flutter/services.dart' show rootBundle;
+import 'package:onnxruntime/onnxruntime.dart';
+import 'package:image/image.dart' as img;
 import 'package:flutter/material.dart';
 import 'package:flutter/cupertino.dart';
 import 'package:image_picker/image_picker.dart';
@@ -711,6 +716,119 @@ class _RetroCard extends StatelessWidget {
 
 /// ---------- Add Meal page (camera + mock AI, keyboard-safe) ----------
 
+class CalorieModel {
+  CalorieModel._();
+  static final CalorieModel instance = CalorieModel._();
+
+  bool _initialized = false;
+  OrtSession? _session;
+
+  static const List<double> _mean = [0.485, 0.456, 0.406];
+  static const List<double> _std = [0.229, 0.224, 0.225];
+
+  Future<void> init() async {
+    if (_initialized) return;
+
+    OrtEnv.instance.init();
+
+    const assetPath = 'assets/models/calorie_regressor_efficientnet_b0.onnx';
+    final raw = await rootBundle.load(assetPath);
+    final bytes = raw.buffer.asUint8List();
+
+    final options = OrtSessionOptions();
+    _session = OrtSession.fromBuffer(bytes, options);
+
+    _initialized = true;
+  }
+
+  Future<double> estimateCaloriesFromImage(File imageFile) async {
+    if (!_initialized) {
+      await init();
+    }
+
+    final session = _session!;
+    final bytes = await imageFile.readAsBytes();
+    final decoded = img.decodeImage(bytes);
+    if (decoded == null) {
+      throw Exception('Failed to decode image');
+    }
+
+    final img.Image resized =
+        img.copyResize(decoded, width: 224, height: 224);
+
+    // Build NCHW float32: [1, 3, 224, 224]
+    final data = List<double>.filled(3 * 224 * 224, 0.0);
+    var idx = 0;
+    for (var c = 0; c < 3; c++) {
+      final mean = _mean[c];
+      final std = _std[c];
+      for (var y = 0; y < 224; y++) {
+        for (var x = 0; x < 224; x++) {
+          final p = resized.getPixel(x, y);
+          double v;
+          if (c == 0) {
+            v = p.r / 255.0;
+          } else if (c == 1) {
+            v = p.g / 255.0;
+          } else {
+            v = p.b / 255.0;
+          }
+          data[idx++] = (v - mean) / std;
+        }
+      }
+    }
+
+    final floatData = Float32List.fromList(data);
+
+    final inputTensor = OrtValueTensor.createTensorWithDataList(
+      floatData,
+      [1, 3, 224, 224],
+    );
+
+    final runOptions = OrtRunOptions();
+    final outputs =
+        await session.runAsync(runOptions, {'input': inputTensor});
+
+    inputTensor.release();
+    runOptions.release();
+
+    if (outputs == null || outputs.isEmpty || outputs[0] == null) {
+      throw Exception('ONNX inference failed: no output');
+    }
+
+    final outTensor = outputs[0]!;
+    final outValue = outTensor.value;
+    outTensor.release();
+    for (final o in outputs.skip(1)) {
+      o?.release();
+    }
+
+    // Be flexible about what the plugin returns
+    double logKcal;
+
+    if (outValue is Float32List) {
+      logKcal = outValue[0];
+    } else if (outValue is List) {
+      final first = outValue.first;
+      if (first is num) {
+        logKcal = first.toDouble();
+      } else if (first is Float32List && first.isNotEmpty) {
+        logKcal = first[0];
+      } else if (first is List && first.isNotEmpty && first.first is num) {
+        logKcal = (first.first as num).toDouble();
+      } else {
+        throw Exception('Unexpected ONNX output element type: ${first.runtimeType}');
+      }
+    } else {
+      throw Exception('Unexpected ONNX output type: ${outValue.runtimeType}');
+    }
+
+    final kcal = math.exp(logKcal) - 1.0;
+    print('DEBUG kcal = $kcal (log=$logKcal)');
+    return kcal < 0 ? 0.0 : kcal;
+  }
+}
+
 class AddMealPage extends StatefulWidget {
   final ProfileData profile;
   final void Function(MealEntry) onMealAdded;
@@ -762,13 +880,24 @@ class _AddMealPageState extends State<AddMealPage> {
       _estimatedCalories = null;
     });
 
-    // TODO: Replace this with actual backend call.
-    await Future.delayed(const Duration(seconds: 1));
+    try {
+      // 1) Make sure the model is loaded
+      await CalorieModel.instance.init();
 
-    setState(() {
-      _isEstimating = false;
-      _estimatedCalories = 550; // mock value
-    });
+      // 2) Run estimation on the captured image
+      final kcal = await CalorieModel.instance
+          .estimateCaloriesFromImage(File(_imageFile!.path));
+
+      setState(() {
+        _isEstimating = false;
+        _estimatedCalories = kcal;
+      });
+    } catch (e) {
+      setState(() {
+        _isEstimating = false;
+      });
+      _showSnackBar("Error estimating calories: $e");
+    }
   }
 
   void _saveMeal() {

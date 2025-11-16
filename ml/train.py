@@ -1,253 +1,349 @@
 import json
 from pathlib import Path
+from typing import List, Tuple
 
 import torch
 import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader, random_split
+from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms, models
+from PIL import Image
 from tqdm.auto import tqdm
 
-from data import load_mm_food
+
+MIN_CALORIES = 0.0
+
+DATA_ROOT = Path("data/mm_food_100k")
+IMG_DIR = DATA_ROOT / "images"
+META_PATH = DATA_ROOT / "meta.jsonl"
 
 
-class FoodTorchDataset(Dataset):
-    def __init__(self, hf_dataset, label2idx, transform=None):
-        self.ds = hf_dataset
-        self.label2idx = label2idx
+# -----------------------
+# Dataset / loading
+# -----------------------
+class LocalFoodDataset(Dataset):
+    def __init__(self, meta: List[dict], transform=None):
+        self.meta = meta
         self.transform = transform
-        self.indices = [
-            i
-            for i, ex in enumerate(self.ds)
-            if ex.get("dish_name") and ex.get("calories_kcal") is not None
-        ]
 
-    def __len__(self):
-        return len(self.indices)
+    def __len__(self) -> int:
+        return len(self.meta)
 
-    def __getitem__(self, idx):
-        ex = self.ds[self.indices[idx]]
-        img = ex["image"]
+    def __getitem__(self, idx: int):
+        ex = self.meta[idx]
+
+        img_path = IMG_DIR / ex["filename"]
+        img = Image.open(img_path).convert("RGB")
         if self.transform:
             img = self.transform(img)
-        label = self.label2idx[ex["dish_name"]]
+
         calories = float(ex["calories_kcal"])
-        return (
-            img,
-            torch.tensor(label, dtype=torch.long),
-            torch.tensor(calories, dtype=torch.float32),
+        calories = max(calories, MIN_CALORIES)
+
+        return img, torch.tensor(calories, dtype=torch.float32)
+
+
+def load_meta(meta_path: Path, max_samples: int | None = None) -> List[dict]:
+    meta: List[dict] = []
+    if not meta_path.is_file():
+        raise FileNotFoundError(f"Metadata file not found: {meta_path}")
+
+    with meta_path.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                ex = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            meta.append(ex)
+
+    cleaned: List[dict] = []
+    for ex in meta:
+        if ex.get("calories_kcal") is None:
+            continue
+        img_path = IMG_DIR / ex["filename"]
+        if not img_path.is_file():
+            continue
+        cleaned.append(ex)
+
+    if max_samples is not None:
+        cleaned = cleaned[:max_samples]
+
+    return cleaned
+
+
+def build_transforms(train: bool):
+    if train:
+        return transforms.Compose(
+            [
+                transforms.Resize(256),
+                transforms.RandomResizedCrop(224),
+                transforms.RandomHorizontalFlip(),
+                transforms.ToTensor(),
+                transforms.Normalize(
+                    mean=[0.485, 0.456, 0.406],
+                    std=[0.229, 0.224, 0.225],
+                ),
+            ]
+        )
+    else:
+        return transforms.Compose(
+            [
+                transforms.Resize(256),
+                transforms.CenterCrop(224),
+                transforms.ToTensor(),
+                transforms.Normalize(
+                    mean=[0.485, 0.456, 0.406],
+                    std=[0.229, 0.224, 0.225],
+                ),
+            ]
         )
 
 
-class FoodModel(nn.Module):
-    def __init__(self, num_classes: int):
+def build_datasets_from_meta(
+    meta: List[dict],
+    val_ratio: float = 0.1,
+) -> Tuple[Dataset, Dataset]:
+    n = len(meta)
+    if n == 0:
+        raise ValueError("No valid samples found in metadata.")
+
+    perm = torch.randperm(n).tolist()
+    val_size = max(1, int(n * val_ratio))
+    train_size = n - val_size
+
+    train_idx = perm[:train_size]
+    val_idx = perm[train_size:]
+
+    train_meta = [meta[i] for i in train_idx]
+    val_meta = [meta[i] for i in val_idx]
+
+    train_dataset = LocalFoodDataset(
+        train_meta,
+        transform=build_transforms(train=True),
+    )
+    val_dataset = LocalFoodDataset(
+        val_meta,
+        transform=build_transforms(train=False),
+    )
+
+    return train_dataset, val_dataset
+
+
+def build_dataloaders(train_dataset, val_dataset, batch_size: int = 32):
+    common_kwargs = dict(num_workers=0, pin_memory=False)
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        **common_kwargs,
+    )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        **common_kwargs,
+    )
+    return train_loader, val_loader
+
+
+# -----------------------
+# Model: calories only
+# -----------------------
+class CalorieRegressor(nn.Module):
+    """
+    EfficientNet-B0 backbone with a regression head.
+    Predicts log(calories + 1), which is later expm1'ed back to calories.
+    """
+
+    def __init__(self):
         super().__init__()
         backbone = models.efficientnet_b0(
             weights=models.EfficientNet_B0_Weights.IMAGENET1K_V1
         )
         in_features = backbone.classifier[1].in_features
         backbone.classifier = nn.Identity()
+
         self.backbone = backbone
-        self.fc_cls = nn.Linear(in_features, num_classes)
         self.fc_reg = nn.Linear(in_features, 1)
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         feats = self.backbone(x)
-        logits = self.fc_cls(feats)
-        calories = self.fc_reg(feats).squeeze(1)
-        return logits, calories
+        log_kcal = self.fc_reg(feats).squeeze(1)
+        # keep log_kcal reasonably bounded below; calories can't be negative
+        log_kcal = log_kcal.clamp_min(0.0)
+        return log_kcal
+
+    @staticmethod
+    def log_to_kcal(log_kcal: torch.Tensor) -> torch.Tensor:
+        kcal = torch.expm1(log_kcal)
+        return kcal.clamp_min(MIN_CALORIES)
 
 
-def build_label_mapping(ds, out_dir: Path):
-    dish_names = sorted(
-        list(
-            {
-                ex["dish_name"]
-                for ex in tqdm(ds, desc="Collect dish names")
-                if ex.get("dish_name")
-            }
-        )
-    )
-    label2idx = {name: i for i, name in enumerate(dish_names)}
-    idx2label = {i: name for name, i in label2idx.items()}
-
-    out_dir.mkdir(exist_ok=True, parents=True)
-    with (out_dir / "label_mapping.json").open("w") as f:
-        json.dump({"label2idx": label2idx, "idx2label": idx2label}, f)
-
-    return label2idx, idx2label
+def build_model(lr: float):
+    model = CalorieRegressor()
+    reg_loss = nn.SmoothL1Loss()
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    return model, reg_loss, optimizer
 
 
-def build_dataloaders(ds_train_hf, label2idx, batch_size=32, val_ratio=0.1):
-    transform = transforms.Compose(
-        [
-            transforms.Resize(256),
-            transforms.CenterCrop(224),
-            transforms.ToTensor(),
-            transforms.Normalize(
-                mean=[0.485, 0.456, 0.406],
-                std=[0.229, 0.224, 0.225],
-            ),
-        ]
-    )
+# -----------------------
+# Train / val
+# -----------------------
+def _step(
+    model,
+    imgs,
+    calories,
+    reg_loss,
+    device,
+):
+    imgs = imgs.to(device)
+    calories = calories.to(device).clamp_min(MIN_CALORIES)
 
-    full_dataset = FoodTorchDataset(ds_train_hf, label2idx, transform=transform)
+    target_log = torch.log1p(calories)
+    pred_log = model(imgs)
 
-    val_size = int(len(full_dataset) * val_ratio)
-    train_size = len(full_dataset) - val_size
-    train_dataset, val_dataset = random_split(full_dataset, [train_size, val_size])
+    loss = reg_loss(pred_log, target_log)
 
-    train_loader = DataLoader(
-        train_dataset, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True
-    )
-    val_loader = DataLoader(
-        val_dataset, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True
-    )
+    with torch.no_grad():
+        pred_kcal = CalorieRegressor.log_to_kcal(pred_log)
+        mae = torch.abs(pred_kcal - calories).mean()
 
-    return train_loader, val_loader
+    return loss, mae
 
 
 def train_one_epoch(
     model,
     train_loader,
     optimizer,
-    ce_loss,
-    mse_loss,
+    reg_loss,
     device,
-    reg_lambda: float,
     epoch: int,
     num_epochs: int,
 ):
     model.train()
     total_loss = 0.0
-    total_cls_loss = 0.0
-    total_reg_loss = 0.0
+    total_mae = 0.0
     n_train = len(train_loader.dataset)
 
     train_pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{num_epochs} [train]")
-    for imgs, labels, calories in train_pbar:
-        imgs = imgs.to(device, non_blocking=True)
-        labels = labels.to(device, non_blocking=True)
-        calories = calories.to(device, non_blocking=True)
-
+    for imgs, calories in train_pbar:
         optimizer.zero_grad()
-        logits, cal_pred = model(imgs)
 
-        loss_cls = ce_loss(logits, labels)
-        loss_reg = mse_loss(cal_pred, calories)
-        loss = loss_cls + reg_lambda * loss_reg
+        loss, mae = _step(
+            model,
+            imgs,
+            calories,
+            reg_loss,
+            device,
+        )
 
         loss.backward()
         optimizer.step()
 
         batch_size = imgs.size(0)
         total_loss += loss.item() * batch_size
-        total_cls_loss += loss_cls.item() * batch_size
-        total_reg_loss += loss_reg.item() * batch_size
+        total_mae += mae.item() * batch_size
 
         train_pbar.set_postfix(
             {
                 "loss": f"{total_loss / n_train:.4f}",
-                "cls": f"{total_cls_loss / n_train:.4f}",
-                "reg": f"{total_reg_loss / n_train:.4f}",
+                "mae_kcal": f"{total_mae / n_train:.2f}",
             }
         )
 
-    return (
-        total_loss / n_train,
-        total_cls_loss / n_train,
-        total_reg_loss / n_train,
-    )
+    return total_loss / n_train, total_mae / n_train
 
 
-def validate(model, val_loader, ce_loss, mse_loss, device, reg_lambda: float, epoch, num_epochs):
+@torch.no_grad()
+def validate(
+    model,
+    val_loader,
+    reg_loss,
+    device,
+    epoch: int,
+    num_epochs: int,
+):
     model.eval()
     val_loss = 0.0
-    correct = 0
-    total = 0
+    val_mae = 0.0
     n_val = len(val_loader.dataset)
 
     val_pbar = tqdm(val_loader, desc=f"Epoch {epoch}/{num_epochs} [val]")
-    with torch.no_grad():
-        for imgs, labels, calories in val_pbar:
-            imgs = imgs.to(device, non_blocking=True)
-            labels = labels.to(device, non_blocking=True)
-            calories = calories.to(device, non_blocking=True)
+    for imgs, calories in val_pbar:
+        loss, mae = _step(
+            model,
+            imgs,
+            calories,
+            reg_loss,
+            device,
+        )
 
-            logits, cal_pred = model(imgs)
-            loss_cls = ce_loss(logits, labels)
-            loss_reg = mse_loss(cal_pred, calories)
-            loss = loss_cls + reg_lambda * loss_reg
+        batch_size = imgs.size(0)
+        val_loss += loss.item() * batch_size
+        val_mae += mae.item() * batch_size
 
-            batch_size = imgs.size(0)
-            val_loss += loss.item() * batch_size
+        val_pbar.set_postfix(
+            {
+                "val_loss": f"{val_loss / n_val:.4f}",
+                "val_mae_kcal": f"{val_mae / n_val:.2f}",
+            }
+        )
 
-            preds = logits.argmax(dim=1)
-            correct += (preds == labels).sum().item()
-            total += labels.size(0)
-
-            val_pbar.set_postfix(
-                {
-                    "val_loss": f"{val_loss / n_val:.4f}",
-                    "val_acc": f"{correct / total:.4f}",
-                }
-            )
-
-    return val_loss / n_val, correct / total
+    return val_loss / n_val, val_mae / n_val
 
 
+# -----------------------
+# Entry point
+# -----------------------
 def train(
-    num_epochs: int = 1,
-    batch_size: int = 32,
+    num_epochs: int = 8,
+    batch_size: int = 16,
     lr: float = 1e-4,
-    reg_lambda: float = 0.1,
+    max_samples: int | None = 2000,
     out_dir: Path = Path("artifacts"),
 ):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print("using", device)
 
-    ds_train_hf = load_mm_food(split="train")
-    max_samples = 5000
-    ds_train_hf = ds_train_hf.select(range(min(max_samples, len(ds_train_hf))))
-    label2idx, _ = build_label_mapping(ds_train_hf, out_dir)
+    meta = load_meta(META_PATH, max_samples=max_samples)
+    print(f"Loaded {len(meta)} local samples")
 
-    train_loader, val_loader = build_dataloaders(
-        ds_train_hf, label2idx, batch_size=batch_size
-    )
+    train_dataset, val_dataset = build_datasets_from_meta(meta, val_ratio=0.1)
+    train_loader, val_loader = build_dataloaders(train_dataset, val_dataset, batch_size)
 
-    model = FoodModel(num_classes=len(label2idx)).to(device)
-    ce_loss = nn.CrossEntropyLoss()
-    mse_loss = nn.MSELoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    model, reg_loss, optimizer = build_model(lr)
+    model = model.to(device)
 
     for epoch in range(1, num_epochs + 1):
-        train_loss, train_cls, train_reg = train_one_epoch(
+        train_loss, train_mae = train_one_epoch(
             model,
             train_loader,
             optimizer,
-            ce_loss,
-            mse_loss,
+            reg_loss,
             device,
-            reg_lambda,
             epoch,
             num_epochs,
         )
         print(
             f"\nEpoch {epoch}/{num_epochs} "
-            f"train_loss={train_loss:.4f} cls={train_cls:.4f} reg={train_reg:.4f}"
+            f"train_loss={train_loss:.4f} train_mae_kcal={train_mae:.2f}"
         )
 
-        val_loss, val_acc = validate(
+        val_loss, val_mae = validate(
             model,
             val_loader,
-            ce_loss,
-            mse_loss,
+            reg_loss,
             device,
-            reg_lambda,
             epoch,
             num_epochs,
         )
-        print(f"  val_loss={val_loss:.4f} val_acc={val_acc:.4f}")
+        print(f"  val_loss={val_loss:.4f} val_mae_kcal={val_mae:.2f}")
 
-    model_path = out_dir / "food_model_efficientnet_b0.pt"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    model_path = out_dir / "calorie_regressor_efficientnet_b0.pt"
     torch.save(model.state_dict(), model_path)
     print("Saved model to", model_path)
 
